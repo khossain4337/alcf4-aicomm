@@ -834,7 +834,13 @@ allreduce_grad = torch.ones([highest_bucket_size], dtype=data_type, device=get_d
 if rank==0:
     logging.info("start loop")
 
-#tensor_parallel(args.warmup_iterations, args.number_of_transformer_layers, n_iter_grad_sync, warmup=True)
+# Untimed; also keeps warmup out of the profiler trace.
+if args.warmup_iterations > 0:
+    tensor_parallel(args.warmup_iterations, args.number_of_transformer_layers, n_iter_grad_sync,
+                    input=input, partial_input=partial_input, partial_interim2=partial_interim2,
+                    partial_interim4=partial_interim4, attn_W_QKV=attn_W_QKV, attn_WO=attn_WO,
+                    mat_h_4h=mat_h_4h, mat_4h_h=mat_4h_h, allreduce_grad=allreduce_grad,
+                    global_context_ulss=global_context_ulss, warmup=True)
 
 if args.trace is not None:
     activities=[ProfilerActivity.CPU]
