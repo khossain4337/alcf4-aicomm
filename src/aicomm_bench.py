@@ -130,7 +130,9 @@ logging.basicConfig(level="INFO" if rank == 0 or args.log_all_ranks else "WARNIN
 
 logging.info(f"rank {rank}/{world_size}")
 
-dev.set_device(rank % int(os.environ["PALS_LOCAL_SIZE"]))
+# No mask: all tiles visible. --gpu-bind: one tile per rank, so device_count()=1.
+assert int(os.environ["PALS_LOCAL_SIZE"]) <= dev.device_count() or dev.device_count() == 1
+dev.set_device(int(os.environ["PALS_LOCAL_RANKID"]) % dev.device_count())
 device = f"{args.device}:{dev.current_device()}"
 
 # MASTER_ADDR / MASTER_PORT come from mpiexec -env
@@ -318,14 +320,13 @@ interim1, interim2, interim3, interim4 = result[3:7]
 ulss_interim1, ulss_interim2, ulss_interim3, ulss_interim4 = result[7:11]
 logging.info(f"ulss_interim_1 Shape from results = {ulss_interim1.shape}")
 
-tp_allreduce_1_data_volume = (interim2.shape[0] * interim2.shape[-1] * data_type_multiplier)
-tp_allreduce_2_data_volume = (interim4.shape[0] * interim4.shape[-1] * data_type_multiplier)
-sp_allgather_data_volume = ((TP - 1) * (S // TP) * H * data_type_multiplier)
-ulss_all2all_data_volume = ((TP - 1) * S * (H // TP) * data_type_multiplier)
 
-
-def mbps(bits, t_ns):
-    return ((bits / 8) / t_ns) * 1e3
+def log_bw(name, nbytes, n, factor, t_ns):
+    """nccl-tests convention: alg bw = buffer bytes / time; bus bw = alg bw * factor,
+    factor = 2(n-1)/n for allreduce, (n-1)/n for allgather/reduce-scatter/all2all. bytes/ns = GB/s."""
+    hi, lo = nbytes / np.min(t_ns), nbytes / np.max(t_ns)
+    logging.info(f"{name}: {nbytes / 1e6:.1f} MB, n={n}, alg bw max {hi:.2f} min {lo:.2f} GB/s, "
+                 f"bus bw max {hi * factor:.2f} min {lo * factor:.2f} GB/s")
 
 
 def format_logging_timings(text, data, time_multiplier=1.0):
@@ -363,27 +364,21 @@ logging.info(f"Parameters (per rank) = {number_of_total_parameters / 1e9} Billio
 logging.info(f"N_iter_grad_sync = {n_iter_grad_sync}")
 logging.info(f"Allgather buffer size = {(args.sequence_length * args.hidden_dimension * data_type_multiplier) / 8 / 1e6} MB")
 logging.info(f"Grad Sync Allreduce bucket size = {(highest_bucket_size * data_type_multiplier) / 8 / 1e6} MB")
-grad_bits = highest_bucket_size * data_type_multiplier
-logging.info(f"Maximum DP Allreduce Throughput = {mbps(grad_bits, np.min(T_grad_sync_individual))} MB/s")
-logging.info(f"Minimum DP Allreduce Throughput = {mbps(grad_bits, np.max(T_grad_sync_individual))} MB/s")
-MAX_MIN = (("Max.", np.min), ("Min.", np.max))
+B = data_type_multiplier // 8
+DP = world_size // TP
+ar = lambda n: 2 * (n - 1) / n
+ag = lambda n: (n - 1) / n  # allgather, reduce-scatter, all2all
+logging.info("\n==== Bandwidth per call ====")
+log_bw("DP grad allreduce, per bucket", highest_bucket_size * B, DP, ar(DP), T_grad_sync_individual)
 if ULSS:
-    logging.info(f"ULSS All2All data volume per layer per iteration = {ulss_all2all_data_volume / 8 / 1e6} MB")
-    for stat, f in MAX_MIN:
-        for n in (1, 2):
-            logging.info(f"ULSS All2All {n} {stat} Throughput per layer per iteration = {mbps(ulss_all2all_data_volume, f(T_dict_individual[f'T_all2all_{n}']))} MB/s")
+    for k in (1, 2):
+        log_bw(f"ULSS all2all {k}", S * (H // TP) * B, TP, ag(TP), T_dict_individual[f"T_all2all_{k}"])
 elif SP:
-    logging.info(f"SP Allgather data volume per layer per iteration = {sp_allgather_data_volume / 8 / 1e6} MB")
-    for name, key in (("SP Allgather 1", "T_allgather_1"), ("SP Allgather 2", "T_allgather_2"),
-                      ("SP Reduce-Scatter 1", "T_reduce_scatter_1"), ("SP Reduce-Scatter 2", "T_reduce_scatter_2")):
-        logging.info(f"{name} Max. Throughput = {mbps(sp_allgather_data_volume, np.min(T_dict_individual[key]))} MB/s")
+    for op in ("allgather_1", "reduce_scatter_1", "allgather_2", "reduce_scatter_2"):
+        log_bw(f"SP {op}", S * H * B, TP, ag(TP), T_dict_individual[f"T_{op}"])
 else:
-    tp_volumes = {1: tp_allreduce_1_data_volume, 2: tp_allreduce_2_data_volume}
-    for n in (1, 2):
-        logging.info(f"TP Allreduce {n} data volume per layer per iteration = {tp_volumes[n] / 8 / 1e6} MB")
-    for stat, f in MAX_MIN:
-        for n in (1, 2):
-            logging.info(f"TP Allreduce {n} {stat} Throughput per layer per iteration = {mbps(tp_volumes[n], f(T_dict_individual[f'T_allreduce_{n}']))} MB/s")
+    for k in (1, 2):
+        log_bw(f"TP allreduce {k}", S * H * B, TP, ar(TP), T_dict_individual[f"T_allreduce_{k}"])
 
 TIMING_LABELS = [
     ("First All2All for ULSS", "T_all2all_1"),
@@ -403,14 +398,14 @@ TIMING_LABELS = [
     ("Second Reduce Scatter for SP", "T_reduce_scatter_2"),
     ("Second Allreduce for TP", "T_allreduce_2"),
 ]
-GRAD_LABEL = "Grad Sync Allreduce over DP groups"
+bucket_mb = highest_bucket_size * B / 1e6
 
 logging.info("\n==== Timings per transformer layer ====")
 for text, key in TIMING_LABELS:
     format_logging_timings(text, T_dict_individual[key], 1e6)
-format_logging_timings(GRAD_LABEL, T_grad_sync_individual, 1e6)
+format_logging_timings(f"Grad Sync Allreduce per bucket (one {bucket_mb:.0f} MB allreduce)", T_grad_sync_individual, 1e6)
 logging.info("\n==== Total Times for all transformer layers ====")
-for text, key in TIMING_LABELS + [(GRAD_LABEL, "T_grad_sync")]:
+for text, key in TIMING_LABELS + [(f"Grad Sync Allreduce per timing loop ({n_iter_grad_sync} buckets)", "T_grad_sync")]:
     format_logging_timings(text, T_dict_total[key])
 
 ALL_RESULTS = [
