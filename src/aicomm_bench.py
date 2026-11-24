@@ -30,9 +30,6 @@ parser.add_argument("-wit", "--warmup_iterations", help="number of warmup iterat
 parser.add_argument("-bucket", "--grad_allreduce_bucket", help="The largest bucket of message passed to do the allreduce over the data parallel groups (in number of elements in a message).",
                     type=float, default=5e8)
 
-parser.add_argument("-dp_switch", "--data_parallel_switch", help="If TRUE, calculates data parallelism degree based of tp_degree",
-                    type=bool, default=True)
-
 parser.add_argument("-tp_degree", "--tensor_parallel_degree", help="Tensor Parallel degree. In this context, the model is distributed across the number of (tensor parallel degree)) ranks",
                     type=int, default=None)
 
@@ -62,8 +59,6 @@ parser.add_argument("-f", "--log_file", help="Output file name",
 parser.add_argument("-dir", "--log_directory", help="Output file path",
                     type=str, default="logs/")
 
-parser.add_argument("--tg1", help="TP with first half of GPUs", action='store_true')
-parser.add_argument("--tg2", help="TP with second half of GPUs", action='store_true')
 parser.add_argument("--no_grad_sync", help="Do NOT perform gradient synchronization over dp groups", action='store_true')
 parser.add_argument("--barrier", help="Put a torch barrier before the grad sync allreduce", action='store_true')
 
@@ -147,11 +142,9 @@ dist.init_process_group(
 )
 
 TP = args.tensor_parallel_degree or 1
-half = slice(None, TP // 2) if args.tg1 else slice(TP // 2, None) if args.tg2 else slice(None)
-
 tp_group = None
 for i in range(world_size // TP):
-    ranks = list(range(i * TP, (i + 1) * TP))[half]
+    ranks = list(range(i * TP, (i + 1) * TP))
     if rank == 0:
         logging.info(f"TP group = {ranks}")
     group = dist.new_group(ranks)
@@ -165,19 +158,13 @@ for i in range(world_size // TP):
 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 """
 
 dp_group = None
-if args.data_parallel_switch:
-    for i in range(TP)[half]:
-        ranks = list(range(i, world_size, TP))
-        if rank == 0:
-            logging.info(f"DP group = {ranks}")
-        group = dist.new_group(ranks)
-        if rank in ranks:
-            dp_group = group
-else:
-    ranks = list(range(0, world_size, TP))
-    dp_group = dist.new_group(ranks)
+for i in range(TP):
+    ranks = list(range(i, world_size, TP))
     if rank == 0:
         logging.info(f"DP group = {ranks}")
+    group = dist.new_group(ranks)
+    if rank in ranks:
+        dp_group = group
 
 """
 0,12,24,36
@@ -268,10 +255,8 @@ def tensor_parallel(N_timing_loop, n_layers, n_iter_grad_sync, warmup=False):
             if ULSS:
                 ulss_interim1 = t("T_ulss_QKV", lambda: torch.matmul(partial_input, attn_W_QKV.t()))
                 t("T_all2all_1", lambda: dist.all_to_all_single(global_context_ulss, input_ulss, group=tp_group))
-                logging.info(f"global_context_ulss shape after 1st a2a = {global_context_ulss.shape}")
                 ulss_interim1 = ulss_interim1.reshape([S, M, H // TP])
                 t("T_all2all_2", lambda: dist.all_to_all_single(ulss_interim1, global_context_ulss, group=tp_group))
-                logging.info(f"ulss_interim1_shape after 2nd a2a = {ulss_interim1.shape}")
                 ulss_interim1 = ulss_interim1.reshape([S // TP, M, H])
                 ulss_interim2 = t("T_ulss_WO", lambda: torch.matmul(ulss_interim1, attn_WO.t()))
                 ulss_interim3 = t("T_ulss_H_4H", lambda: torch.matmul(ulss_interim2, mat_h_4h.t()))
