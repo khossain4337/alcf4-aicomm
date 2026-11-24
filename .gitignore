@@ -1,0 +1,8 @@
+# Allowlist: ignore all, then re-include what we track on purpose.
+*
+!*/
+!.gitignore
+!README.md
+!src/*.py
+!src/*.sh
+!scripts/*.sh
