@@ -30,6 +30,7 @@ TP_DEGREE=2
 NNODES=`wc -l < $PBS_NODEFILE`
 NRANKS_PER_NODE=1
 let NRANKS=${NNODES}*${NRANKS_PER_NODE}
+export PALS_WORLD_SIZE=${NRANKS}  # PALS does not set this
 
 module load frameworks
 
